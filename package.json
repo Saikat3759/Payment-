@@ -1,15 +1,13 @@
 {
-  "name": "payment-help",
+  "name": "android-observer-app",
   "version": "1.0.0",
-  "description": "Customer Payment Help Portal, History & Support Chat for YOUPI PG",
+  "description": "Native Android Payment Notification Observer App & Companion Driver for YOUPI PG",
   "type": "module",
-  "main": "./src/index.js",
+  "main": "./driver.js",
   "scripts": {
-    "start": "node src/index.js",
-    "test": "node --test src/__tests__/**/*.test.js"
+    "test": "node --test __tests__/**/*.test.js"
   },
   "dependencies": {
-    "@youpi/common": "*",
-    "@youpi/db": "*"
+    "@youpi/common": "*"
   }
 }

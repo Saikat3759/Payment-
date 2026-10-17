@@ -253,6 +253,16 @@
         targetUrl = `${this.options.portalUrl}/checkout/demo`;
       }
 
+      // If running on localhost / 127.0.0.1 and targetUrl points to remote domain, normalize to localhost host
+      if (isBrowser && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')) {
+        if (targetUrl.includes('gauravtesting.online')) {
+          try {
+            const parsed = new URL(targetUrl);
+            targetUrl = `${window.location.protocol}//${window.location.host}${parsed.pathname}${parsed.search}`;
+          } catch {}
+        }
+      }
+
       // Add embedded flag and custom params
       const sep = targetUrl.includes('?') ? '&' : '?';
       targetUrl = `${targetUrl}${sep}embedded=1`;
@@ -734,9 +744,9 @@
   // Export globals
   globalScope.YoupiCheckout = YoupiCheckout;
   globalScope.Youpi = YoupiCheckout;
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = YoupiCheckout;
+    module.exports.YoupiCheckout = YoupiCheckout;
+    module.exports.Youpi = YoupiCheckout;
+  }
 })(typeof window !== 'undefined' ? window : globalThis);
-
-const _exportedCheckout = (typeof window !== 'undefined' ? window : globalThis).YoupiCheckout;
-export const YoupiCheckout = _exportedCheckout;
-export const Youpi = _exportedCheckout;
-export default _exportedCheckout;

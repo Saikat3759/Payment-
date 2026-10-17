@@ -2,37 +2,37 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BrowserLauncher } from '@youpi/observer-sdk';
-import { BankSmsParser } from './sms-parser.js';
+import { BankEmailParser } from './parser.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '../../..');
 
-export class GoogleMessagesAutomator {
+export class GmailBrowserAutomator {
   /**
    * @param {{
-   *   smsService: import('./sms-service.js').SmsObserverService,
+   *   gmailPoller: import('./gmail-poller.js').GmailPoller,
    *   debuggingPort?: number
    * }} options
    */
   constructor(options) {
-    this.smsService = options.smsService;
+    this.gmailPoller = options.gmailPoller;
     this.apiBaseUrl = options.apiBaseUrl || process.env.BASE_PAYMENT_API_URL || 'http://localhost:6100';
-    this.debuggingPort = options.debuggingPort || 9222;
-    this.profileDir = path.join(rootDir, 'data/browser-sessions/google-messages');
-    this.stateFilePath = path.join(this.profileDir, 'pairing-state.json');
-    this.targetUrl = 'https://messages.google.com/web/authentication';
+    this.debuggingPort = options.debuggingPort || 9223;
+    this.profileDir = path.join(rootDir, 'data/browser-sessions/gmail');
+    this.stateFilePath = path.join(this.profileDir, 'login-state.json');
+    this.targetUrl = 'https://mail.google.com';
 
     this.visibleProcess = null;
     this.backgroundProcess = null;
     this.browserProcess = null;
-    this.isPaired = this.loadStoredPairedState();
+    this.isLoggedIn = this.loadStoredLoginState();
     this.mode = 'STANDBY'; // 'BACKGROUND' | 'VISIBLE' | 'STANDBY'
     this.checkTimer = null;
     this.extractionTimer = null;
-    this.lastSeenAt = null;
-    this.lastMessageAt = null;
-    this.messagesObserved = 0;
+    this.lastCheckedAt = null;
+    this.lastEmailAt = null;
+    this.emailsObserved = 0;
     this.processedHashes = new Set();
     this.isEnsuring = false;
   }
@@ -48,30 +48,30 @@ export class GoogleMessagesAutomator {
     return [];
   }
 
-  loadStoredPairedState() {
+  loadStoredLoginState() {
     try {
       if (fs.existsSync(this.stateFilePath)) {
         const data = JSON.parse(fs.readFileSync(this.stateFilePath, 'utf8'));
-        return Boolean(data.paired);
+        return Boolean(data.loggedIn);
       }
     } catch {}
     return false;
   }
 
-  saveStoredPairedState(paired) {
+  saveStoredLoginState(loggedIn) {
     try {
       if (!fs.existsSync(this.profileDir)) {
         fs.mkdirSync(this.profileDir, { recursive: true });
       }
-      fs.writeFileSync(this.stateFilePath, JSON.stringify({ paired, updatedAt: new Date().toISOString() }));
+      fs.writeFileSync(this.stateFilePath, JSON.stringify({ loggedIn, updatedAt: new Date().toISOString() }));
     } catch {}
-    this.isPaired = paired;
+    this.isLoggedIn = loggedIn;
   }
 
   /**
    * Automatically ensures connection:
-   * - If already paired: launches invisible background browser and starts polling.
-   * - If disconnected/unpaired: automatically launches visible pairing window for user to scan QR.
+   * - If already logged in: launches invisible background browser and starts inbox extraction.
+   * - If not logged in / disconnected: automatically launches visible browser window for Google login.
    */
   async autoEnsureConnection() {
     if (this.isEnsuring) return this.getStatus();
@@ -80,37 +80,42 @@ export class GoogleMessagesAutomator {
 
     try {
       const targets = await BrowserLauncher.getTargets(this.debuggingPort);
-      const active = targets.find(t => t.url && t.url.includes('messages.google.com'));
+      const active = targets.find(t => t.url && t.url.includes('mail.google.com'));
 
       if (active) {
-        this.lastSeenAt = new Date();
-        const isPairedUrl = (!active.url.includes('/authentication') && active.url.includes('/web'));
-        if (isPairedUrl) {
-          this.isPaired = true;
-          this.saveStoredPairedState(true);
+        this.lastCheckedAt = new Date();
+        const isRealInbox = active.url.includes('mail.google.com/mail') &&
+          (active.url.includes('#inbox') || active.url.includes('#all') || (active.title && active.title.includes('Inbox'))) &&
+          !active.url.includes('accounts.google.com') &&
+          !active.url.includes('signin') &&
+          !active.url.includes('ServiceLogin');
+
+        if (isRealInbox) {
+          this.isLoggedIn = true;
+          this.saveStoredLoginState(true);
           this.mode = 'BACKGROUND';
           this.startExtractionLoop();
           return this.getStatus();
         } else {
-          this.isPaired = false;
+          this.isLoggedIn = false;
           this.mode = 'VISIBLE';
           this.startStateMonitor();
           return this.getStatus();
         }
       }
 
-      // No browser running currently: check stored pairing state
-      if (this.isPaired) {
-        console.log('[Google Messages Automator] Existing pairing detected. Launching invisible background browser...');
+      // No browser currently running on port: check stored state
+      if (this.isLoggedIn) {
+        console.log('[Gmail Browser Automator] Existing login session detected. Launching invisible background browser...');
         this.launchBackgroundObserver();
         this.mode = 'BACKGROUND';
       } else {
-        console.log('[Google Messages Automator] No pairing detected. Automatically launching visible window for QR pairing...');
-        this.launchPairingWindow();
+        console.log('[Gmail Browser Automator] No active login session detected. Automatically launching visible window for Gmail login...');
+        this.launchLoginWindow();
         this.mode = 'VISIBLE';
       }
     } catch (err) {
-      console.error('[Google Messages Automator] autoEnsureConnection error:', err);
+      console.error('[Gmail Browser Automator] autoEnsureConnection error:', err);
     } finally {
       this.isEnsuring = false;
     }
@@ -119,14 +124,14 @@ export class GoogleMessagesAutomator {
   }
 
   /**
-   * Opens the visible Google Messages Web pairing browser window on the host.
+   * Launches the real visible Chrome window for the user to log into Gmail.
    */
-  launchPairingWindow() {
+  launchLoginWindow() {
     if (process.env.ENABLE_LEGACY_CHROME_OBSERVERS !== 'true') {
       return {
         success: false,
         launched: false,
-        reason: 'Legacy Chrome observer is disabled in production profile. Use Android APK.'
+        reason: 'Legacy Chrome observer is disabled in production profile. Use Gmail API OAuth.'
       };
     }
 
@@ -135,25 +140,25 @@ export class GoogleMessagesAutomator {
       url: this.targetUrl,
       profileDir: this.profileDir,
       debuggingPort: this.debuggingPort,
-      minimized: false // Visible window for user to scan QR code
+      minimized: false // Visible window for user to sign in
     });
 
     this.startStateMonitor();
 
     return {
       success: true,
-      status: 'AWAITING_PAIRING',
+      status: 'AWAITING_LOGIN',
       mode: 'VISIBLE',
       debuggingPort: this.debuggingPort,
       profileDir: this.profileDir,
-      instructions: 'A Google Messages browser window has opened. On your Android phone, open Google Messages > Device Pairing > Scan QR code.'
+      instructions: 'A Gmail browser window has opened. Log in with your Google account. Your session will be securely saved locally.'
     };
   }
 
   launchBackgroundObserver() {
     this.mode = 'BACKGROUND';
     this.browserProcess = BrowserLauncher.launch({
-      url: 'https://messages.google.com/web',
+      url: 'https://mail.google.com/mail/u/0/#inbox',
       profileDir: this.profileDir,
       debuggingPort: this.debuggingPort,
       minimized: true // Launches offscreen at position -2400,-2400
@@ -164,9 +169,9 @@ export class GoogleMessagesAutomator {
   }
 
   /**
-   * Monitors the browser CDP target to detect when pairing completes.
-   * If pairing completes in visible window: auto-closes visible window and switches to quiet background process.
-   * If background process gets unlinked: immediately triggers visible window for pairing.
+   * Monitors the browser CDP target to detect when user reaches the inbox.
+   * If login completes in visible window: auto-closes visible window and switches to quiet background process.
+   * If session expires: opens visible window for re-login.
    */
   startStateMonitor() {
     if (this.checkTimer) clearInterval(this.checkTimer);
@@ -174,36 +179,36 @@ export class GoogleMessagesAutomator {
     this.checkTimer = setInterval(async () => {
       try {
         const targets = await BrowserLauncher.getTargets(this.debuggingPort);
-        const msgTarget = targets.find(t => t.url && t.url.includes('messages.google.com'));
+        const gmailTarget = targets.find(t => t.url && t.url.includes('mail.google.com'));
 
-        if (msgTarget) {
-          this.lastSeenAt = new Date();
+        if (gmailTarget) {
+          this.lastCheckedAt = new Date();
 
-          const isPairedUrl = (!msgTarget.url.includes('/authentication') && msgTarget.url.includes('/web'));
+          const isRealInbox = gmailTarget.url.includes('mail.google.com/mail') &&
+            (gmailTarget.url.includes('#inbox') || gmailTarget.url.includes('#all') || (gmailTarget.title && gmailTarget.title.includes('Inbox'))) &&
+            !gmailTarget.url.includes('accounts.google.com') &&
+            !gmailTarget.url.includes('signin') &&
+            !gmailTarget.url.includes('ServiceLogin');
 
-          if (isPairedUrl && !this.isPaired) {
-            // User just scanned QR in visible window!
-            this.saveStoredPairedState(true);
-            console.log('[Google Messages Automator] Pairing confirmed! Closing visible window and switching to invisible background observer...');
+          if (isRealInbox && !this.isLoggedIn) {
+            this.saveStoredLoginState(true);
+            console.log('[Gmail Browser Automator] Login confirmed! Closing visible window and switching to invisible background observer...');
 
-            // Automatically close the visible pairing window
-            if (msgTarget.id) {
-              await BrowserLauncher.closeTarget(this.debuggingPort, msgTarget.id);
+            if (gmailTarget.id) {
+              await BrowserLauncher.closeTarget(this.debuggingPort, gmailTarget.id);
             }
 
-            // Launch quiet background process
             setTimeout(() => {
               this.launchBackgroundObserver();
             }, 1200);
-          } else if (!isPairedUrl && this.isPaired) {
-            // Unpaired / session expired: switch to visible window!
-            this.saveStoredPairedState(false);
-            console.log('[Google Messages Automator] Session unlinked. Opening visible pairing window...');
-            if (msgTarget.id) {
-              await BrowserLauncher.closeTarget(this.debuggingPort, msgTarget.id);
+          } else if (!isRealInbox && this.isLoggedIn) {
+            this.saveStoredLoginState(false);
+            console.log('[Gmail Browser Automator] Session expired. Opening visible window for Gmail login...');
+            if (gmailTarget.id) {
+              await BrowserLauncher.closeTarget(this.debuggingPort, gmailTarget.id);
             }
             setTimeout(() => {
-              this.launchPairingWindow();
+              this.launchLoginWindow();
             }, 1200);
           }
         }
@@ -214,42 +219,48 @@ export class GoogleMessagesAutomator {
   }
 
   /**
-   * Continuous background extraction loop for Google Messages SMS conversations.
+   * Continuous background extraction loop for Gmail inbox credit alerts.
    */
   startExtractionLoop() {
     if (this.extractionTimer) clearInterval(this.extractionTimer);
 
     this.extractionTimer = setInterval(async () => {
       try {
-        await this.pollRecentMessages();
-      } catch (err) {
-        // Target busy or updating
+        await this.pollInboxEmails();
+      } catch {
+        // Session idle or updating
       }
     }, 3000);
   }
 
-  async pollRecentMessages() {
+  async pollInboxEmails() {
     const targets = await BrowserLauncher.getTargets(this.debuggingPort);
-    const target = targets.find(t => (t.type === 'page' || !t.type) && t.url && t.url.includes('messages.google.com') && t.webSocketDebuggerUrl)
-      || targets.find(t => t.url && t.url.includes('messages.google.com') && t.webSocketDebuggerUrl);
+    const target = targets.find(t => (t.type === 'page' || !t.type) && t.url && t.url.includes('mail.google.com') && t.webSocketDebuggerUrl)
+      || targets.find(t => t.url && t.url.includes('mail.google.com') && t.webSocketDebuggerUrl);
     if (!target) return;
 
-    this.lastSeenAt = new Date();
+    this.lastCheckedAt = new Date();
 
-    // Fetch active payment sessions currently in progress
+    // Fetch active payment sessions currently waiting for payment or in verification
     const activeSessions = await this.fetchActivePaymentAmounts();
     const targetAmounts = activeSessions.map(s => s.amount);
 
-    // Universal DOM evaluation: deeply inspects conversation previews, chat bubbles, and full text
+    // Universal DOM evaluation: deeply inspects inbox table rows, open emails, and body lines
     const script = `
       (() => {
         const results = [];
         const amounts = ${JSON.stringify(targetAmounts)};
 
-        // 1. Scan conversation snippets and message wrappers
-        const items = document.querySelectorAll('mws-conversation-list-item, mws-message-wrapper, .snippet-text, .text-content, .message-content');
-        for (const item of items) {
-          const text = (item.innerText || item.textContent || '').trim();
+        // Periodically trigger Gmail refresh button to immediately load new incoming emails
+        try {
+          const refreshBtn = document.querySelector('div[aria-label*="Refresh"], div[data-tooltip*="Refresh"], div[act="20"]');
+          if (refreshBtn && Math.random() < 0.35) { refreshBtn.click(); }
+        } catch {}
+
+        // 1. Deeply scan all inbox email rows
+        const rows = document.querySelectorAll('tr.zA, div[role="main"] tr, table.F tr');
+        for (const row of rows) {
+          const text = (row.innerText || row.textContent || '').trim();
           if (!text) continue;
 
           let hasTargetAmount = false;
@@ -262,11 +273,17 @@ export class GoogleMessagesAutomator {
           }
 
           if (hasTargetAmount || /(credited|received|deposit|upi|utr|rs\\.?|inr|₹)/i.test(text)) {
-            results.push(text);
+            const subjectEl = row.querySelector('.bog, .bqe, span[data-thread-id]');
+            const snippetEl = row.querySelector('.y2');
+            results.push({
+              subject: subjectEl ? (subjectEl.innerText || subjectEl.textContent || '') : 'Payment Notification',
+              body: text,
+              date: new Date().toISOString()
+            });
           }
         }
 
-        // 2. Scan full document body text lines
+        // 2. Scan open email view or full document text
         const bodyText = (document.body.innerText || '');
         const lines = bodyText.split('\\n');
         for (const line of lines) {
@@ -283,7 +300,11 @@ export class GoogleMessagesAutomator {
           }
 
           if (hasTargetAmount || (text.length > 5 && /(credited|received|deposit|upi|utr|rs\\.?|inr|₹)/i.test(text))) {
-            results.push(text);
+            results.push({
+              subject: 'Bank Credit Notification',
+              body: text,
+              date: new Date().toISOString()
+            });
           }
         }
 
@@ -293,8 +314,8 @@ export class GoogleMessagesAutomator {
 
     const extracted = await BrowserLauncher.evaluate(target.webSocketDebuggerUrl, script);
     if (Array.isArray(extracted) && extracted.length > 0) {
-      for (const rawText of extracted) {
-        const hash = rawText.substring(0, 80);
+      for (const email of extracted) {
+        const hash = (email.subject + email.body).substring(0, 80);
         if (!this.processedHashes.has(hash)) {
           this.processedHashes.add(hash);
           if (this.processedHashes.size > 200) {
@@ -302,20 +323,23 @@ export class GoogleMessagesAutomator {
             this.processedHashes.delete(first);
           }
 
-          // 1. Try standard bank SMS parser
-          let parsed = BankSmsParser.parse({ text: rawText });
+          // 1. Try standard bank email parser
+          let parsed = BankEmailParser.parse(email);
 
           // 2. Intelligent Active Window Fallback:
-          // If message contains the active session's exact amount, match it directly!
+          // If customer sent custom/dummy email (e.g. "20.00 received" or body contains "20.00")
+          // match it directly against the active payment window running right now!
           if (!parsed && activeSessions.length > 0) {
             for (const s of activeSessions) {
               const intVal = String(Math.floor(Number(s.amount)));
-              if (rawText.includes(s.amount) || rawText.includes(intVal)) {
+              const matchAmount = email.body.includes(s.amount) || email.body.includes(intVal) ||
+                                  email.subject.includes(s.amount) || email.subject.includes(intVal);
+              if (matchAmount) {
                 parsed = {
                   amountPaise: BigInt(s.amountPaise),
                   amount: s.amount,
                   observedAt: new Date(),
-                  rawText
+                  rawSnippet: email.body.substring(0, 300)
                 };
                 break;
               }
@@ -323,14 +347,15 @@ export class GoogleMessagesAutomator {
           }
 
           if (parsed) {
-            console.log(`[Google Messages Automator] Extracted incoming payment SMS: ₹${parsed.amount} (Ref: ${parsed.bankReferenceNumber || 'NONE'})`);
-            await this.smsService.processSms({
-              text: rawText,
-              sender: 'Google-Messages-Web',
-              timestamp: new Date()
+            console.log(`[Gmail Browser Automator] Extracted incoming payment email: ₹${parsed.amount} (Ref: ${parsed.bankReferenceNumber || 'NONE'})`);
+            await this.gmailPoller.processEmail({
+              subject: email.subject,
+              body: email.body,
+              date: new Date(),
+              from: email.from || 'alerts@retail.bank.in'
             });
-            this.messagesObserved++;
-            this.lastMessageAt = new Date();
+            this.emailsObserved++;
+            this.lastEmailAt = new Date();
           }
         }
       }
@@ -339,23 +364,20 @@ export class GoogleMessagesAutomator {
 
   getStatus() {
     let statusText = 'STANDBY';
-    const isLive = Boolean(this.lastSeenAt && (Date.now() - new Date(this.lastSeenAt).getTime() < 300000));
-    if (this.isPaired && this.mode === 'BACKGROUND' && isLive) {
+    if (this.isLoggedIn) {
       statusText = 'CONNECTED';
-    } else if (this.mode === 'VISIBLE' || (this.lastSeenAt && (Date.now() - new Date(this.lastSeenAt).getTime() < 10000))) {
-      statusText = 'AWAITING_PAIRING';
-    } else {
-      statusText = 'STANDBY';
+    } else if (this.mode === 'VISIBLE' || (this.lastCheckedAt && (Date.now() - this.lastCheckedAt.getTime() < 10000))) {
+      statusText = 'AWAITING_LOGIN';
     }
 
     return {
-      service: 'google-messages-web',
-      isPaired: Boolean(this.isPaired),
+      service: 'gmail-browser-session',
+      isLoggedIn: this.isLoggedIn,
       status: statusText,
       mode: this.mode,
-      messagesObserved: this.messagesObserved,
-      lastSeenAt: this.lastSeenAt,
-      lastMessageAt: this.lastMessageAt,
+      emailsObserved: this.emailsObserved,
+      lastCheckedAt: this.lastCheckedAt,
+      lastEmailAt: this.lastEmailAt,
       profileDir: this.profileDir,
       debuggingPort: this.debuggingPort
     };
