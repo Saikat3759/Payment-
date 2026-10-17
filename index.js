@@ -18,7 +18,14 @@ export function startCheckoutServer(port = null, options = {}) {
   });
 }
 
-// Auto-run if executed directly as main script
+// Initialize the Checkout Server instance for Vercel Serverless environment
+const checkoutServerInstance = new CheckoutServer();
+const serverApp = checkoutServerInstance.createServer();
+
+// Vercel serverless export requirement
+export default serverApp;
+
+// Auto-run if executed directly as main script locally via Node.js
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   startCheckoutServer();
 }
