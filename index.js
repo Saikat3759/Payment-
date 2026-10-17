@@ -2,30 +2,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CheckoutServer } from './server.js';
 
-export function startCheckoutServer(port = null, options = {}) {
-  const finalPort = port || Number(process.env.CHECKOUT_PORTAL_PORT || 7000);
-  const checkoutServer = new CheckoutServer(options);
-  const rawServer = checkoutServer.createServer();
+const checkoutServer = new CheckoutServer();
+const serverInstance = checkoutServer.createServer();
 
-  return new Promise(resolve => {
-    const instance = rawServer.listen(finalPort, () => {
-      console.log(`[Checkout Portal] Server listening on port ${finalPort}`);
-      resolve({
-        port: finalPort,
-        close: () => new Promise(cb => instance.close(cb))
-      });
-    });
-  });
+// Vercel-এর জন্য সঠিক সার্ভার রিকোয়েস্ট হ্যান্ডলার এক্সপোর্ট
+export default function (req, res) {
+  serverInstance(req, res);
 }
 
-// Initialize the Checkout Server instance for Vercel Serverless environment
-const checkoutServerInstance = new CheckoutServer();
-const serverApp = checkoutServerInstance.createServer();
-
-// Vercel serverless export requirement
-export default serverApp;
-
-// Auto-run if executed directly as main script locally via Node.js
+// লোকাল টার্মিনালের জন্য
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  startCheckoutServer();
+  const finalPort = Number(process.env.CHECKOUT_PORTAL_PORT || 7000);
+  serverInstance.listen(finalPort, () => {
+    console.log(`[Checkout Portal] Server listening on port ${finalPort}`);
+  });
 }
